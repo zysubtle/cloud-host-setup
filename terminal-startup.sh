@@ -97,9 +97,10 @@ termius_choose_directory() {
 # ---------- 接回或恢复 Claude ----------
 termius_launch_claude() {
     local executable digest session pane dead
+    # 只传 PATH。不再传 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1：它会把渲染器
+    # 强制成经典模式，盖过 ~/.claude/settings.json 的 tui 设置；渲染器交给 /tui 决定。
     local -a tmux_env=(
         -e "PATH=$PATH"
-        -e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1
     )
 
     for executable in tmux claude sha256sum; do

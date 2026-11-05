@@ -111,7 +111,7 @@ mosh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接
 - `termius_menu`：通用编号菜单，会过滤方向键等转义序列，输入无效时重新询问。
 - `termius_choose_directory`：扫描 `/data` 的一级子目录，选中后 `cd -P` 进入。
 - `termius_launch_claude`：检查 `tmux` `claude` `sha256sum` 都在，然后按上面「整体链路」的三种情况接回或新建会话。
-  传给 tmux 会话的环境：`PATH`（保证找得到 `~/.local/bin/claude`）和 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`。
+  传给 tmux 会话的环境：只有 `PATH`（保证找得到 `~/.local/bin/claude`）。不再传 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`——它会把 Claude Code 固定成经典渲染器，盖过 `~/.claude/settings.json` 的 `tui` 设置；渲染器由 `/tui` 决定（全屏在 tmux 里可用，滚轮依赖 tmux `mouse on`）。
 - 最后一行 `clear; { termius_choose_directory && termius_launch_claude; } || :` 保证任何一步失败都只是留在 shell，不会把登录 shell 带崩。
 
 本目录里的 `terminal-startup.sh` 是一份独立的普通文件，登录时实际读取的是 `~/.terminal-startup.sh`，两者需要手动保持一致。
