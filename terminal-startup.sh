@@ -97,6 +97,14 @@ termius_choose_directory() {
 # ---------- 接回或恢复 Claude ----------
 termius_launch_claude() {
     local executable digest session pane dead
+
+    # 非交互 shell（例如 ssh -t 主机 'bash ~/.terminal-startup.sh'）里，~/.bashrc
+    # 开头遇到非交互就 return，执行不到末尾的 PATH 设置，也不读 ~/.profile，
+    # 于是找不到 ~/.local/bin/claude。这里自己补上；已在 PATH 里则不重复添加。
+    if [[ -d $HOME/.local/bin && :$PATH: != *":$HOME/.local/bin:"* ]]; then
+        PATH="$HOME/.local/bin:$PATH"
+    fi
+
     # 只传 PATH。不再传 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1：它会把渲染器
     # 强制成经典模式，盖过 ~/.claude/settings.json 的 tui 设置；渲染器交给 /tui 决定。
     local -a tmux_env=(
