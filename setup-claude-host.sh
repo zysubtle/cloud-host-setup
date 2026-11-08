@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 #
-# setup-claude-host.sh — 在新的 Ubuntu 云主机上一键配置「mosh + tmux + Claude Code」远程工作环境
+# setup-claude-host.sh — 在新的 Ubuntu 云主机上一键配置「ssh + tmux + Claude Code」远程工作环境
 #
 # 做的事情:
-#   1. apt 安装 mosh tmux curl
-#   2. 确保 locale 为 UTF-8，并生成 en_US.UTF-8（mosh 对 locale 很挑剔）
-#   3. ufw 启用时放行 mosh 的 UDP 60000-61000（云厂商安全组仍需手动放行）
-#   4. ~/.bashrc 加入 ~/.local/bin 到 PATH
-#   5. 检查 claude 是否已安装（不代装；没有则提示先安装并退出）
-#   6. 创建 /data（有数据盘的话之后用 mount-data-disk.sh 挂到这里）
-#   7. 写入 ~/.mosh-rc，并把本脚本同目录的 terminal-startup.sh 复制为 ~/.terminal-startup.sh
-#   8. 同目录有 setup-xrdp.sh 时，用 sudo 执行它安装 XFCE 远程桌面（可选，SKIP_XRDP=1 跳过）
-#   9. 打印客户端要用的连接命令
+#   1. apt 安装 tmux curl
+#   2. 确保 locale 为 UTF-8，并生成 en_US.UTF-8（tmux / Claude 显示中文和框线字符需要 UTF-8）
+#   3. ~/.bashrc 加入 ~/.local/bin 到 PATH
+#   4. 检查 claude 是否已安装（不代装；没有则提示先安装并退出）
+#   5. 创建 /data（有数据盘的话之后用 mount-data-disk.sh 挂到这里）
+#   6. 写入 ~/.terminal-rc，并把本脚本同目录的 terminal-startup.sh 复制为 ~/.terminal-startup.sh
+#   7. 同目录有 setup-xrdp.sh 时，用 sudo 执行它安装 XFCE 远程桌面（可选，SKIP_XRDP=1 跳过）
+#   8. 打印客户端要用的连接命令
 #
 # 用法（在新主机上用普通用户运行，需要 sudo；不要用 root）:
 #   scp -r ~/cloud-setup user@host:~/
@@ -19,15 +18,15 @@
 #
 # 可选环境变量:
 #   STARTUP_SRC=/路径  指定启动脚本来源文件（默认找本脚本同目录的 terminal-startup.sh）
-#   USER_ONLY=1    只做用户目录下的配置，跳过所有需要 sudo 的步骤（apt / locale / ufw / 建 /data）
-#   FORCE=1        覆盖已存在但内容不同的 ~/.terminal-startup.sh 和 ~/.mosh-rc（原文件会备份）
+#   USER_ONLY=1    只做用户目录下的配置，跳过所有需要 sudo 的步骤（apt / locale / 建 /data）
+#   FORCE=1        覆盖已存在但内容不同的 ~/.terminal-startup.sh 和 ~/.terminal-rc（原文件会备份）
 #   SKIP_XRDP=1    不执行同目录的 setup-xrdp.sh
 #   XRDP_ARGS="..." 传给 setup-xrdp.sh 的参数，例如 XRDP_ARGS="--public --no-browser"
 #
 set -euo pipefail
 
 DATA_ROOT=/data
-RC_FILE="$HOME/.mosh-rc"
+RC_FILE="$HOME/.terminal-rc"
 STARTUP_FILE="$HOME/.terminal-startup.sh"
 BASHRC="$HOME/.bashrc"
 USER_ONLY="${USER_ONLY:-0}"
@@ -48,9 +47,9 @@ if [[ $USER_ONLY != 1 ]]; then
   [[ "${ID:-}" == ubuntu || "${ID_LIKE:-}" == *debian* ]] || warn "不是 Ubuntu/Debian，apt 相关步骤可能失败"
 
   # ---------- 1. 软件包 ----------
-  log "安装 mosh tmux curl"
+  log "安装 tmux curl"
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mosh tmux curl ca-certificates
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux curl ca-certificates
 
   # ---------- 2. locale ----------
   log "检查 locale"
@@ -62,19 +61,13 @@ if [[ $USER_ONLY != 1 ]]; then
     warn "当前会话 locale 不是 UTF-8，把系统默认设为 LANG=C.UTF-8（重新登录后生效）"
     sudo update-locale LANG=C.UTF-8
   fi
-
-  # ---------- 3. ufw ----------
-  if command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q '^Status: active'; then
-    log "ufw 已启用，放行 mosh 的 UDP 60000:61000"
-    sudo ufw allow 60000:61000/udp >/dev/null
-  fi
 fi
 
-for bin in mosh-server tmux sha256sum; do
+for bin in tmux sha256sum; do
   command -v "$bin" >/dev/null || die "未找到 $bin，请先安装"
 done
 
-# ---------- 4. PATH ----------
+# ---------- 3. PATH ----------
 log "确保 $BASHRC 中有 ~/.local/bin"
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 if ! grep -qxF "$PATH_LINE" "$BASHRC" 2>/dev/null; then
@@ -83,21 +76,21 @@ if ! grep -qxF "$PATH_LINE" "$BASHRC" 2>/dev/null; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-# ---------- 5. Claude Code（不代装，只检查） ----------
+# ---------- 4. Claude Code（不代装，只检查） ----------
 if command -v claude >/dev/null; then
   log "Claude Code 已安装: $(command -v claude)"
 else
   die "未找到 claude。请先自行安装 Claude Code（并确保它在 PATH 里，例如 ~/.local/bin），然后重新运行本脚本"
 fi
 
-# ---------- 6. /data ----------
+# ---------- 5. /data ----------
 if [[ $USER_ONLY != 1 && ! -d $DATA_ROOT ]]; then
   log "创建 $DATA_ROOT（有数据盘的话，之后用 mount-data-disk.sh 挂到这里）"
   sudo mkdir -p "$DATA_ROOT"
   sudo chown "$USER:$(id -gn)" "$DATA_ROOT"
 fi
 
-# ---------- 7. 配置文件 ----------
+# ---------- 6. 配置文件 ----------
 # write_file <路径>  （内容从 stdin 读入）
 # 已存在且内容相同 -> 跳过；内容不同 -> 默认不覆盖，FORCE=1 时备份后覆盖
 write_file() {
@@ -144,7 +137,7 @@ else
   write_file "$STARTUP_FILE" < "$startup_src"
 fi
 
-# ---------- 8. 远程桌面（可选：同目录有 setup-xrdp.sh 时执行） ----------
+# ---------- 7. 远程桌面（可选：同目录有 setup-xrdp.sh 时执行） ----------
 XRDP_SCRIPT="$script_dir/setup-xrdp.sh"
 XRDP_DONE=0
 XRDP_FAILED=0
@@ -159,33 +152,32 @@ elif [[ -f $XRDP_SCRIPT ]]; then
     XRDP_DONE=1
   else
     XRDP_FAILED=1
-    warn "setup-xrdp.sh 执行失败，上面 mosh 相关配置不受影响；可稍后单独重跑: sudo bash $XRDP_SCRIPT $XRDP_ARGS"
+    warn "setup-xrdp.sh 执行失败，前面的配置不受影响；可稍后单独重跑: sudo bash $XRDP_SCRIPT $XRDP_ARGS"
   fi
 else
   log "同目录没有 setup-xrdp.sh，跳过远程桌面"
 fi
 
-# ---------- 9. 总结 ----------
+# ---------- 8. 总结 ----------
 public_ip=$(curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null || echo '<公网IP>')
 cat <<EOF
 
 ================= 服务器端配置完成 =================
 
-接下来在客户端（Mac / Ubuntu）做三件事：
+接下来在客户端（Mac / Ubuntu）做两件事：
 
-1. 云厂商安全组放行 UDP 60000-61000
-   阿里云：入方向，自定义 UDP，端口 60000/61000，来源 0.0.0.0/0
-
-2. ~/.ssh/config 加一段（别名随意）:
+1. ~/.ssh/config 加一段（别名随意）:
    Host <别名>
        HostName $public_ip
        User $USER
        ServerAliveInterval 60
    并确认 ssh <别名> 'echo ok' 能免密通过（不行就 ssh-copy-id <别名>）
 
-3. Terminal 描述文件的「运行命令」填（必须是绝对路径，mosh 不展开 ~）:
-   mosh --predict=never <别名> -- bash --rcfile $RC_FILE
+2. Terminal 描述文件的「运行命令」填:
+   ssh -t <别名> bash --rcfile $RC_FILE
+   -t 不能省：带命令时 ssh 默认不分配终端，目录菜单和 tmux 都需要终端。
 
+ssh 断线不会中断 Claude（它跑在 tmux 里），重连后选同一目录即可接回。
 首次使用前，先普通 ssh 登录一次运行 claude 完成授权，
 否则启动脚本里的 claude --continue 进不去。
 本机自测：bash --rcfile $RC_FILE  应直接弹出 /data 的目录菜单。
