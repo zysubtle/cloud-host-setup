@@ -1,14 +1,14 @@
-# cloud-setup — 云主机「mosh + tmux + Claude Code」远程工作环境
+# cloud-setup — 云主机「ssh + tmux + Claude Code」远程工作环境
 
 把这个目录整个拷到一台新的 Ubuntu 云主机上，跑一个脚本，之后就能从 Mac / Ubuntu 用
-mosh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接回该目录的 Claude Code 会话。
+ssh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接回该目录的 Claude Code 会话。
 
 ## 目录内容
 
 | 文件 | 作用 | 在哪运行 |
 |---|---|---|
-| `setup-claude-host.sh` | 一键配置主机：装 mosh/tmux、locale、ufw、PATH、写 `~/.mosh-rc`，安装启动脚本，可选装远程桌面 | 新主机，普通用户 |
-| `terminal-startup.sh` | 登录后的目录菜单 + 接回/恢复 Claude 的 tmux 会话（部署时被复制为 `~/.terminal-startup.sh`） | 由 `~/.mosh-rc` 自动 source |
+| `setup-claude-host.sh` | 一键配置主机：装 tmux、locale、PATH、写 `~/.terminal-rc`，安装启动脚本，可选装远程桌面 | 新主机，普通用户 |
+| `terminal-startup.sh` | 登录后的目录菜单 + 接回/恢复 Claude 的 tmux 会话（部署时被复制为 `~/.terminal-startup.sh`） | 由 `~/.terminal-rc` 自动 source |
 | `mount-data-disk.sh` | 识别、格式化并挂载 ECS 数据盘到 `/data`，写入 fstab | 新主机，sudo |
 | `setup-xrdp.sh` | 安装 XFCE 桌面 + xrdp + Firefox，供 Mac 的 Windows App 远程桌面连接 | 新主机，sudo（`setup-claude-host.sh` 会自动调用） |
 
@@ -16,8 +16,8 @@ mosh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接
 
 ```
 客户端 Terminal / Termius
-  └─ mosh --predict=never <别名> -- bash --rcfile /home/<用户>/.mosh-rc
-       └─ ~/.mosh-rc        : source ~/.bashrc ; cd /data ; source ~/.terminal-startup.sh
+  └─ ssh -t <别名> bash --rcfile /home/<用户>/.terminal-rc
+       └─ ~/.terminal-rc    : source ~/.bashrc ; cd /data ; source ~/.terminal-startup.sh
             └─ terminal-startup.sh
                  1. 列出 /data 下的一级子目录（含隐藏目录），让你选一个
                  2. cd 进去，按目录物理路径算出固定会话名  termius-claude-<sha256(目录)>
@@ -28,6 +28,7 @@ mosh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接
 
 - 菜单里输入 `0`、直接回车、`q` 或 Ctrl-D 会退出菜单，停在 `/data` 的普通 shell。
 - 在 Claude 里按 `Ctrl-b d` 脱离 tmux，回到 shell；下次连上再选同一目录就接回来。
+- ssh 断线（换网络、电脑休眠）不会中断 Claude，它一直跑在 tmux 里；重新连接后选同一目录即可接回。
 - 同一个目录永远对应同一个 tmux 会话，所以多台客户端选同一目录会看到同一个画面。
 - 会话名前缀 `termius-claude-` 和函数名 `termius_*` 是刻意保留的，改掉会让已有会话接不回来。
 
@@ -59,13 +60,13 @@ mosh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接
    | `SKIP_XRDP=1` | 不装远程桌面 |
    | `XRDP_ARGS="--public --no-browser"` | 透传给 `setup-xrdp.sh` 的参数 |
    | `USER_ONLY=1` | 只写用户目录下的配置，跳过所有需要 sudo 的步骤 |
-   | `FORCE=1` | 覆盖已存在且内容不同的 `~/.mosh-rc` / `~/.terminal-startup.sh`（原文件自动备份） |
+   | `FORCE=1` | 覆盖已存在且内容不同的 `~/.terminal-rc` / `~/.terminal-startup.sh`（原文件自动备份） |
    | `STARTUP_SRC=/路径` | 指定启动脚本来源文件（默认用本目录的 `terminal-startup.sh`） |
 
    脚本可以重复执行：配置文件内容相同就跳过，不同且没给 `FORCE=1` 时只警告不覆盖。
 
 5. **云厂商安全组放行**
-   - mosh：入方向 UDP `60000/61000`
+   - 日常连接只用 SSH（TCP `22`），能跑上面的脚本就说明已经通了，不用再加规则。
    - 远程桌面用了 `--public` 时：入方向 TCP `3389`（来源建议只填自己的 IP）
 
 6. **客户端配置**
@@ -78,35 +79,35 @@ mosh 一连上去就看到 `/data` 下的项目菜单，选一个目录直接接
        ServerAliveInterval 60
    ```
 
-   连接命令（Terminal.app 描述文件的「运行命令」、Termius 的 Snippet 都填这一条）：
+   连接命令（Terminal.app 描述文件的「运行命令」、Termius 本地终端的 Snippet 都填这一条）：
    ```bash
-   mosh --predict=never <别名> -- bash --rcfile /home/<用户>/.mosh-rc
+   ssh -t <别名> bash --rcfile /home/<用户>/.terminal-rc
    ```
-   - 必须写绝对路径：mosh 会把 `--` 后面的每个参数单引号包起来，服务器端不会展开 `~` 或 `$HOME`。
+   - `-t` 不能省：带命令时 ssh 默认不分配终端，bash 不会进入交互模式，目录菜单和 tmux 都起不来。
+   - 建议写绝对路径：写 `~` 的话要加引号，否则会被本地 shell 展开成本机的路径。
    - 不要再在外面套一层 `tmux new -A`，启动脚本自己管理 tmux。
-   - Termius 内置的 Mosh 关不掉预测回显（会出现幽灵字符），所以用系统的 mosh 客户端。
+   - 用 Termius 自带的 SSH 连主机时，也可以把 `exec bash --rcfile ~/.terminal-rc` 设为该主机的启动 Snippet（在服务器上执行）。
 
 ## 各脚本详细说明
 
 ### setup-claude-host.sh
 
-按顺序做这些事（`USER_ONLY=1` 时跳过前三项和建 `/data`）：
+按顺序做这些事（`USER_ONLY=1` 时跳过前两项和建 `/data`）：
 
-1. `apt` 安装 `mosh tmux curl ca-certificates`
+1. `apt` 安装 `tmux curl ca-certificates`
 2. 生成 `en_US.UTF-8`，当前 locale 不是 UTF-8 时把系统默认设为 `C.UTF-8`
-3. ufw 已启用时放行 UDP 60000:61000
-4. `~/.bashrc` 加入 `~/.local/bin` 到 PATH
-5. 检查 `claude` 是否可用，没有就退出（不代装）
-6. 创建 `/data` 并把属主改成当前用户
-7. 写入 `~/.mosh-rc`，把 `terminal-startup.sh` 复制为 `~/.terminal-startup.sh`
-8. 同目录有 `setup-xrdp.sh` 时用 sudo 执行它（失败不影响前面的配置，脚本以退出码 1 结束）
-9. 打印安全组、ssh config、连接命令三件事
+3. `~/.bashrc` 加入 `~/.local/bin` 到 PATH
+4. 检查 `claude` 是否可用，没有就退出（不代装）
+5. 创建 `/data` 并把属主改成当前用户
+6. 写入 `~/.terminal-rc`，把 `terminal-startup.sh` 复制为 `~/.terminal-startup.sh`
+7. 同目录有 `setup-xrdp.sh` 时用 sudo 执行它（失败不影响前面的配置，脚本以退出码 1 结束）
+8. 打印 ssh config、连接命令两件事
 
 不能用 root 运行，否则配置会写到 `/root` 下。
 
 ### terminal-startup.sh
 
-被 `~/.mosh-rc` source，不是独立执行的脚本（没有 shebang，不要 `bash terminal-startup.sh`）。
+被 `~/.terminal-rc` source，不是独立执行的脚本（没有 shebang，不要 `bash terminal-startup.sh`）。
 
 - `termius_menu`：通用编号菜单，会过滤方向键等转义序列，输入无效时重新询问。
 - `termius_choose_directory`：扫描 `/data` 的一级子目录，选中后 `cd -P` 进入。
@@ -156,7 +157,7 @@ sudo bash setup-xrdp.sh --no-browser  # 不装 Firefox（snap 包，约 1.5 GB�
 ## 本机自测
 
 ```bash
-bash --rcfile ~/.mosh-rc        # 应直接弹出 /data 的目录菜单；输 0 回到 shell
+bash --rcfile ~/.terminal-rc    # 应直接弹出 /data 的目录菜单；输 0 回到 shell
 bash -n ~/.terminal-startup.sh  # 语法检查
 HOME=$(mktemp -d) USER_ONLY=1 bash ~/cloud-setup/setup-claude-host.sh   # 在临时目录里演练安装
 ```
@@ -166,18 +167,18 @@ HOME=$(mktemp -d) USER_ONLY=1 bash ~/cloud-setup/setup-claude-host.sh   # 在临
 
 ## 常见问题
 
-- **连上后没有菜单，直接是 shell**
-  看 `~/.mosh-rc` 第二行是否存在；`/data` 下没有任何子目录时菜单也会跳过并提示。
+- **连上后没有菜单，直接是 shell，或者什么都不显示**
+  先看连接命令有没有带 `-t`；再看 `~/.terminal-rc` 第二行是否存在；`/data` 下没有任何子目录时菜单也会跳过并提示。
 - **`claude --continue` 进不去 / 窗口一闪就退**
   先普通 ssh 登录运行一次 `claude` 完成授权；或者 `~/.local/bin` 不在 PATH 里（脚本会往 `~/.bashrc` 追加）。
-- **mosh 连不上或报 locale 错误**
-  安全组是否放行 UDP 60000-61000；客户端传过来的 `LANG`（例如 `en_NZ.UTF-8`）服务器上要有，没有就 `sudo locale-gen <该 locale>`。
-  从日本走阿里云加速线路 IP 时 UDP 会被丢，mosh 断断续续，改连直连公网 IP 即可。
-- **Termius 里出现幽灵字符**
-  内置 Mosh 的预测回显关不掉，改用系统 mosh 命令加 `--predict=never`。
+- **登录时报 `setlocale: ... cannot change locale`**
+  客户端经 ssh 传过来的 `LANG`（例如 `en_NZ.UTF-8`）服务器上没有，`sudo locale-gen <该 locale>` 后重新连接。
 
 ## 更名记录
 
 2026-11-04：`termius-startup.sh` 改名为 `terminal-startup.sh`（它已不只给 Termius 用）。
 `~/.termius-startup.sh` 保留为指向新文件的符号链接，旧的 Termius Snippet 不改也能用；
 客户端全部改成新名字后可以删掉这个链接。
+
+2026-11-08：改用 ssh 连接，不再安装 mosh、不再放行 UDP 60000-61000；`~/.mosh-rc` 改名为 `~/.terminal-rc`。
+已经部署过的旧主机不受影响，上面的 `~/.mosh-rc` 和 mosh 照旧可用。
