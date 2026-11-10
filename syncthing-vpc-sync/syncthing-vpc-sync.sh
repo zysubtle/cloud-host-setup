@@ -8,6 +8,7 @@
 #   sudo bash syncthing-vpc-sync.sh            交互式安装与配置（两台同时运行，需要互相输入设备 ID）
 #   sudo bash syncthing-vpc-sync.sh finalize   仅 B：等首次同步完成后切换为双向（setup 结束时也可直接进入）
 #   sudo bash syncthing-vpc-sync.sh status     查看连接与同步状态
+#   sudo bash syncthing-vpc-sync.sh uninstall  卸载：停止同步，删除 Syncthing 和本脚本的配置（同步目录里的文件保留）
 #
 # 可选环境变量：
 #   ST_VERSION=v2.1.7          指定要下载的 Syncthing 版本（默认 GitHub 最新版；本机已安装则跳过安装）
@@ -29,6 +30,9 @@ fi
 set -Eeuo pipefail
 
 STATE_FILE=/etc/syncthing-vpc-sync.conf
+UNIT_FILE=/etc/systemd/system/syncthing@.service
+ST_BIN=/usr/bin/syncthing
+SYSCTL_FILE=/etc/sysctl.d/90-syncthing-inotify.conf
 SYNC_PORT=22000
 SELF=${BASH_SOURCE[0]:-syncthing-vpc-sync.sh}
 
@@ -175,7 +179,7 @@ ensure_deps() {
 }
 
 unit_exists() {
-  [[ -f /etc/systemd/system/syncthing@.service || -f /lib/systemd/system/syncthing@.service ||
+  [[ -f $UNIT_FILE || -f /lib/systemd/system/syncthing@.service ||
     -f /usr/lib/systemd/system/syncthing@.service ]]
 }
 
@@ -183,7 +187,7 @@ unit_exists() {
 # 官方安装包里的服务文件带有较新的沙箱选项，需要较新的 systemd，例如其中的
 # 系统调用白名单 @system-service 在 systemd 239 之前不存在，会导致 Syncthing 无法正常运行。
 write_basic_unit() {
-  cat >/etc/systemd/system/syncthing@.service <<EOF
+  cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=Syncthing - Open Source Continuous File Synchronization for %I
 Documentation=man:syncthing(1)
@@ -281,12 +285,12 @@ install_syncthing() {
     tar -xzf "$tb" -C "$TMPD/x" || die "解压失败：$tb"
     bin=$(find "$TMPD/x" -maxdepth 2 -type f -name syncthing | sed -n 1p)
     [[ -n $bin ]] || die "安装包中没有找到 syncthing 程序：$tb"
-    install -m 0755 "$bin" /usr/bin/syncthing
-    ok "已安装到 /usr/bin/syncthing"
+    install -m 0755 "$bin" "$ST_BIN"
+    ok "已安装到 $ST_BIN"
     unitsrc=$(find "$TMPD/x" -type f -path '*/etc/linux-systemd/system/syncthing@.service' | sed -n 1p)
     # 官方服务文件带较新的沙箱选项，只在 systemd 247 及以上（Ubuntu 22.04 及以上）使用
     if ! unit_exists && [[ -n $unitsrc ]] && (($(systemd_version) >= 247)); then
-      install -m 0644 "$unitsrc" /etc/systemd/system/syncthing@.service
+      install -m 0644 "$unitsrc" "$UNIT_FILE"
     fi
   fi
   if ! unit_exists; then write_basic_unit; fi
@@ -297,8 +301,8 @@ tune_inotify() {
   local cur
   cur=$(sysctl -n fs.inotify.max_user_watches 2>/dev/null || true)
   if ((${cur:-0} < 524288)); then
-    echo 'fs.inotify.max_user_watches=524288' >/etc/sysctl.d/90-syncthing-inotify.conf
-    sysctl -q -p /etc/sysctl.d/90-syncthing-inotify.conf >/dev/null 2>&1 || true
+    echo 'fs.inotify.max_user_watches=524288' >"$SYSCTL_FILE"
+    sysctl -q -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
     ok "已调大 inotify 监控上限：$cur -> 524288"
   fi
 }
@@ -952,18 +956,255 @@ Syncthing     : $(api GET /rest/system/version | jq -r .version)
 EOF
 }
 
+# 本机所有 syncthing@ 服务实例对应的用户（已加载的，或设置了开机自启的）
+st_instances() {
+  local f
+  {
+    systemctl list-units --all --plain --no-legend 'syncthing@*.service' 2>/dev/null | awk '{print $1}' || true
+    for f in "${UNIT_FILE%/*}"/*.wants/syncthing@*.service; do
+      if [[ -L $f || -e $f ]]; then printf '%s\n' "${f##*/}"; fi
+    done
+  } | sed -n 's/^syncthing@\(..*\)\.service$/\1/p' | sort -u
+}
+
+# 卸载前查看同步进度，有没同步完的内容时输出提示，查不到就什么都不输出。
+# 函数体在子 shell 里运行，api_init 失败时只会退出子 shell
+sync_progress() (
+  local need='' pct=''
+  [[ -n $FOLDER_ID && -n $PEER_ID && $(svc_state) == active ]] || exit 0
+  command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || exit 0
+  api_init >/dev/null 2>&1 || exit 0
+  need=$(api GET "/rest/db/status?folder=$FOLDER_ID" | jq -r '.needTotalItems // empty' || true)
+  pct=$(api GET "/rest/db/completion?folder=$FOLDER_ID&device=$PEER_ID" | jq -r '.completion // empty | floor' || true)
+  if [[ $need =~ ^[0-9]+$ ]] && ((need > 0)); then
+    echo "本机还有 $need 项没有从 $PEER_ROLE 同步过来，卸载后就不会再同步了"
+  fi
+  if [[ $pct =~ ^[0-9]+$ ]] && ((pct < 100)); then
+    echo "$PEER_ROLE 的同步进度是 ${pct}%，本机卸载后，还没传给 $PEER_ROLE 的内容就传不过去了"
+  fi
+)
+
+# fw_has_rule 规则：firewalld 的运行时或永久配置里有这条 rich rule
+fw_has_rule() {
+  firewall-cmd -q --query-rich-rule="$1" 2>/dev/null || firewall-cmd -q --permanent --query-rich-rule="$1" 2>/dev/null
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  require_ubuntu
+  need_tty
+  local -a users=() units=() cfgs=() files=() own=() fx=() keep=()
+  local u h d f pkg='' keep_bin='' added='' rule='' frule='' prog='' counts='' ntmp=0 nconf=0 vsize='' del_ver='' out qpath
+  if [[ -f $STATE_FILE ]]; then
+    # shellcheck source=/dev/null
+    source "$STATE_FILE"
+    if [[ $ROLE == A ]]; then PEER_ROLE=B; else PEER_ROLE=A; fi
+  fi
+
+  # ---- 找出要卸载的内容 ----
+  mapfile -t users < <({
+    if [[ -n $RUN_USER ]]; then printf '%s\n' "$RUN_USER"; fi
+    st_instances
+  } | awk 'NF && !seen[$0]++')
+  for u in "${users[@]}"; do
+    units+=("syncthing@$u")
+    h=$(user_home "$u")
+    h=${h%/}
+    if [[ -z $h ]]; then continue; fi
+    for d in "$h/.config/syncthing" "$h/.local/state/syncthing"; do
+      if [[ -d $d ]]; then cfgs+=("$d"); fi
+    done
+  done
+  # 程序：本脚本装在 $ST_BIN；属于某个软件包的，说明是 apt 装的；在别的位置的，不是本脚本装的，不动
+  if [[ -e $ST_BIN ]]; then
+    pkg=$(dpkg -S "$ST_BIN" 2>/dev/null |
+      sed -n 's/^\([a-z0-9][a-z0-9+.-]*\)\(:[a-z0-9]*\)\{0,1\}: .*/\1/p' | sed -n 1p || true)
+    if [[ -z $pkg ]]; then files+=("$ST_BIN"); fi
+  else
+    keep_bin=$(command -v syncthing 2>/dev/null || true)
+  fi
+  if [[ -z $pkg && -z $keep_bin && -f $UNIT_FILE ]]; then files+=("$UNIT_FILE"); fi
+  if [[ -n $PEER_IP ]] && command -v ufw >/dev/null 2>&1; then
+    added=$(LC_ALL=C ufw show added 2>/dev/null || true)
+    rule="allow from $PEER_IP to any port $SYNC_PORT proto tcp"
+    if ! grep -qxF "ufw $rule" <<<"$added"; then rule=''; fi
+  fi
+  # 早期版本的脚本在 firewalld 运行时会加这条规则（Ubuntu 默认没有 firewalld）
+  if [[ -n $PEER_IP ]] && command -v firewall-cmd >/dev/null 2>&1 &&
+    systemctl is-active --quiet firewalld 2>/dev/null; then
+    frule="rule family=ipv4 source address=$PEER_IP/32 port port=$SYNC_PORT protocol=tcp accept"
+    if ! fw_has_rule "$frule"; then frule=''; fi
+  fi
+  if [[ -n $FOLDER_PATH && -d $FOLDER_PATH ]]; then
+    counts=$(find "$FOLDER_PATH" -path "$FOLDER_PATH/.stversions" -prune -o \
+      -type f -name '.syncthing.*.tmp' -printf 't\n' -o -name '*.sync-conflict-*' -printf 'c\n' 2>/dev/null || true)
+    ntmp=$(grep -c '^t$' <<<"$counts" || true)
+    nconf=$(grep -c '^c$' <<<"$counts" || true)
+    if [[ -e $FOLDER_PATH/.stfolder ]]; then fx+=(.stfolder); fi
+    if ((ntmp > 0)); then fx+=("$ntmp 个传到一半的临时文件（.syncthing.*.tmp）"); fi
+    if [[ -d $FOLDER_PATH/.stversions ]]; then
+      vsize=$(du -sh "$FOLDER_PATH/.stversions" 2>/dev/null | cut -f1 || true)
+      vsize=${vsize:-?}
+    fi
+  fi
+  for f in "$STATE_FILE" "$SYSCTL_FILE"; do
+    if [[ -f $f ]]; then own+=("$f"); fi
+  done
+
+  if ((${#units[@]} + ${#files[@]} + ${#cfgs[@]} + ${#own[@]} == 0)) && [[ -z $pkg ]]; then
+    info "本机没有找到 Syncthing 服务、本脚本安装的程序或配置，不需要卸载"
+    if [[ -n $keep_bin ]]; then info "$keep_bin 不是本脚本安装的，没有处理"; fi
+    return 0
+  fi
+
+  # ---- 显示计划，确认后再执行 ----
+  prog=$(sync_progress 2>/dev/null || true)
+  echo
+  echo "${C_BLD}=========== 卸载 Syncthing 私网同步 ===========${C_OFF}"
+  echo "将执行以下操作："
+  if ((${#units[@]})); then echo "  停止并禁用服务    : ${units[*]}"; fi
+  if [[ -n $pkg ]]; then echo "  卸载软件包        : $pkg（用 apt 安装的）"; fi
+  if ((${#files[@]})); then echo "  删除程序          : ${files[*]}"; fi
+  if ((${#cfgs[@]})); then
+    echo "  删除配置和数据库  : ${cfgs[*]}"
+    echo "                      （包括设备密钥，以后重新安装时设备 ID 会改变）"
+  fi
+  if [[ -n $rule ]]; then echo "  删除防火墙规则    : ufw $rule"; fi
+  if [[ -n $frule ]]; then echo "  删除防火墙规则    : firewalld $frule"; fi
+  if ((${#fx[@]})); then
+    printf -v out '%s、' "${fx[@]}"
+    echo "  清理同步目录      : $FOLDER_PATH 中的 ${out%、}"
+  fi
+  if ((${#own[@]})); then echo "  删除本脚本的文件  : ${own[*]}"; fi
+  if [[ -n $FOLDER_PATH && -d $FOLDER_PATH ]]; then
+    if [[ -n $vsize ]]; then
+      keep+=("同步目录 $FOLDER_PATH 中的文件（.stversions 稍后单独询问）")
+    else
+      keep+=("同步目录 $FOLDER_PATH 中的文件")
+    fi
+  fi
+  if ((nconf > 0)); then keep+=("$nconf 个冲突文件（*.sync-conflict-*）"); fi
+  if [[ -n $keep_bin ]]; then keep+=("$keep_bin（不是本脚本安装的）"); fi
+  if ((${#keep[@]})); then
+    echo "保留："
+    printf '  %s\n' "${keep[@]}"
+  fi
+  if [[ -z $FOLDER_PATH ]]; then
+    warn "没有找到 $STATE_FILE，不知道同步目录和对端 IP：目录里的 .stfolder、.stversions，以及 ufw 规则，需要手动清理"
+  fi
+  if [[ -n $prog ]]; then
+    while IFS= read -r out; do warn "$out"; done <<<"$prog"
+  fi
+  echo
+  confirm "确认卸载？" N || die "已取消，没有做任何改动"
+  if [[ -n $vsize ]] &&
+    confirm "同时删除 $FOLDER_PATH/.stversions（$vsize，里面是被删除或覆盖前的旧版本）？" N; then
+    del_ver=1
+  fi
+
+  # ---- 执行：先停服务，停不下来就不删任何东西 ----
+  for u in "${units[@]}"; do
+    systemctl stop "$u" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+      die "无法停止 $u，没有删除任何文件。查看原因：systemctl status $u"
+    fi
+  done
+  for u in "${units[@]}"; do
+    systemctl disable -q "$u" >/dev/null 2>&1 || true
+    # 之前运行失败过的服务会一直留在 systemd 的列表里，清掉，免得再次运行时又被找到
+    systemctl reset-failed "$u" >/dev/null 2>&1 || true
+    # 服务文件已经不在时，disable 删不掉开机自启的链接，这里直接删
+    rm -f -- "${UNIT_FILE%/*}"/*.wants/"$u.service"
+  done
+  if ((${#units[@]})); then ok "已停止并禁用 ${units[*]}"; fi
+
+  if [[ -n $pkg ]]; then
+    if DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \
+      apt-get remove -y -qq -o DPkg::Lock::Timeout=300 "$pkg" >/dev/null 2>&1; then
+      ok "已卸载软件包 $pkg"
+    else
+      warn "卸载软件包 $pkg 失败，请稍后手动执行：apt-get remove $pkg"
+    fi
+  fi
+  if ((${#files[@]})); then
+    rm -f -- "${files[@]}"
+    ok "已删除 ${files[*]}"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ((${#cfgs[@]})); then
+    rm -rf -- "${cfgs[@]}"
+    ok "已删除 Syncthing 的配置和数据库"
+  fi
+  if [[ -n $rule ]]; then
+    out=$(LC_ALL=C ufw --force delete allow from "$PEER_IP" to any port "$SYNC_PORT" proto tcp 2>&1 || true)
+    if [[ $out == *"Rule deleted"* ]]; then
+      ok "已删除 ufw 规则：$rule"
+    else
+      warn "删除 ufw 规则失败，请手动执行：ufw delete $rule"
+    fi
+  fi
+  if [[ -n $frule ]]; then
+    # 运行时和永久规则分别删除，不执行 --reload（reload 会丢掉其他没有持久化的规则）
+    firewall-cmd -q --remove-rich-rule="$frule" >/dev/null 2>&1 || true
+    firewall-cmd -q --permanent --remove-rich-rule="$frule" >/dev/null 2>&1 || true
+    if fw_has_rule "$frule"; then
+      warn "删除 firewalld 规则失败，请手动执行：firewall-cmd --remove-rich-rule='$frule'; firewall-cmd --permanent --remove-rich-rule='$frule'"
+    else
+      ok "已删除 firewalld 规则：$frule"
+    fi
+  fi
+  if ((${#fx[@]})) || [[ -n $del_ver ]]; then
+    rm -rf -- "$FOLDER_PATH/.stfolder"
+    if ((ntmp > 0)); then
+      find "$FOLDER_PATH" -path "$FOLDER_PATH/.stversions" -prune -o \
+        -type f -name '.syncthing.*.tmp' -exec rm -f -- {} + 2>/dev/null || true
+    fi
+    if [[ -n $del_ver ]]; then
+      rm -rf -- "$FOLDER_PATH/.stversions"
+      fx+=(.stversions)
+    fi
+    printf -v out '%s、' "${fx[@]}"
+    ok "已清理同步目录中的 ${out%、}"
+  fi
+  if ((${#own[@]})); then
+    rm -f -- "${own[@]}"
+    ok "已删除 ${own[*]}"
+  fi
+
+  echo
+  ok "本机卸载完成"
+  if [[ -n $FOLDER_PATH && -d $FOLDER_PATH ]]; then
+    echo "  - 同步目录 $FOLDER_PATH 中的文件都还在，现在是普通目录"
+    printf -v qpath '%q' "$FOLDER_PATH"
+    if [[ -n $vsize && -z $del_ver ]]; then
+      echo "  - 旧版本还在 $FOLDER_PATH/.stversions，不需要的话可以手动删除"
+    fi
+    if ((nconf > 0)); then
+      echo "  - 冲突文件已保留，查看：find $qpath -name '*.sync-conflict-*'"
+    fi
+  fi
+  if [[ " ${own[*]} " == *" $SYSCTL_FILE "* ]]; then
+    echo "  - inotify 监控上限会在服务器重启后恢复为系统默认值，不重启也没有影响"
+  fi
+  echo "  - 如果在阿里云安全组里为 TCP $SYNC_PORT 单独加过规则，请到控制台删除"
+  if [[ -n $PEER_IP ]]; then
+    echo "  - $PEER_ROLE（$PEER_IP）也不再同步的话，请在 $PEER_ROLE 上也运行：sudo bash $SELF uninstall"
+  fi
+}
+
 usage() {
   cat <<EOF
 用法：
   sudo bash $SELF            交互式安装与配置（A、B 两台同时运行）
   sudo bash $SELF finalize   仅 B：等首次同步完成后切换为双向
   sudo bash $SELF status     查看连接与同步状态
+  sudo bash $SELF uninstall  卸载（同步目录里的文件保留）
 EOF
 }
 
 main() {
   case ${1:-setup} in
-    setup | finalize | status) ;;
+    setup | finalize | status | uninstall) ;;
     -h | --help | help)
       usage
       return 0
@@ -978,6 +1219,7 @@ main() {
     setup) cmd_setup ;;
     finalize) cmd_finalize ;;
     status) cmd_status ;;
+    uninstall) cmd_uninstall ;;
   esac
 }
 

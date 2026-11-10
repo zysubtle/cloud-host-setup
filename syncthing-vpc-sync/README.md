@@ -22,11 +22,12 @@ A：发送与接收 ─────────────── 私网 TCP 220
 | `sudo bash syncthing-vpc-sync.sh` | A、B | 交互式安装和配置（等同于 `setup`）。可以重复运行，用来修改配置或更改同步目录 |
 | `sudo bash syncthing-vpc-sync.sh finalize` | 只在 B | 等首次同步完成，再把 B 切换为双向。用于 setup 结束时没有切换，或者中途退出的情况 |
 | `sudo bash syncthing-vpc-sync.sh status` | A、B | 查看连接和同步状态 |
+| `sudo bash syncthing-vpc-sync.sh uninstall` | 要卸载的那台 | 卸载：停止同步，删除 Syncthing 和它的配置。同步目录里的文件保留，见"卸载" |
 | `bash syncthing-vpc-sync.sh help` | — | 显示用法 |
 
 - 以 root 登录时可以省略 `sudo`。
 - **请用 `bash` 运行。** Ubuntu 的 `sh` 是 dash，用 `sh` 运行会提示并退出。
-- `setup` 和 `finalize` 需要在交互式终端里运行。
+- `setup`、`finalize` 和 `uninstall` 需要在交互式终端里运行。
 
 ---
 
@@ -482,6 +483,8 @@ systemctl restart syncthing@<运行用户>
 | 软件包 | 缺少时用 apt 安装 `curl`、`jq`、`tar` |
 | 同步目录 | Syncthing 会在里面创建 `.stfolder`（**不要删除**）；启用版本控制时还会有 `.stversions`。B 上的目录不存在时，脚本会创建它，属主为运行用户 |
 
+这些改动都可以用 `uninstall` 撤销，见"卸载"。
+
 ---
 
 ## 出问题怎么办
@@ -556,32 +559,43 @@ timedatectl          # 确认显示 System clock synchronized: yes
 
 ## 卸载
 
-在两台上分别执行。把 `<运行用户>` 等占位符换成实际的值：
+在要卸载的服务器上运行。两台都不再同步的话，A、B 各运行一次：
 
 ```bash
-systemctl stop syncthing@<运行用户>
-systemctl disable syncthing@<运行用户>
-
-# 脚本安装的程序和服务文件（如果 Syncthing 是用 apt 安装的，改用 apt remove syncthing）
-rm -f /usr/bin/syncthing /etc/systemd/system/syncthing@.service
-systemctl daemon-reload
-
-# 脚本的状态文件和 inotify 设置
-rm -f /etc/syncthing-vpc-sync.conf /etc/sysctl.d/90-syncthing-inotify.conf
-
-# Syncthing 的配置、密钥和数据库（删除后，再次安装时设备 ID 会改变）
-rm -rf <运行用户的家目录>/.local/state/syncthing <运行用户的家目录>/.config/syncthing
+sudo bash syncthing-vpc-sync.sh uninstall
 ```
 
-如果启用了 ufw，还要删除放行规则：
+脚本会先列出要做的操作，输入 `y` 确认后才执行。**同步目录里的文件不会删除**，卸载后就是普通目录。
 
-```bash
-ufw delete allow from <对方私网 IP> to any port 22000 proto tcp
-```
+执行的操作：
 
-最后，如果在安全组里加过 22000 的规则，也一并删掉。
+1. 停止并禁用 `syncthing@<运行用户>` 服务。服务停不下来时直接退出，不删除任何东西。
+2. 卸载 Syncthing 程序：
+   - 本脚本安装的：删除 `/usr/bin/syncthing` 和 `/etc/systemd/system/syncthing@.service`；
+   - 用 apt 安装的：执行 `apt-get remove syncthing`；
+   - 装在其他位置的：不是本脚本安装的，保留不动。
+3. 删除 Syncthing 的配置、密钥和数据库（`~/.local/state/syncthing` 或 `~/.config/syncthing`）。以后重新安装，设备 ID 会改变。
+4. 删除脚本加的那条 ufw 规则（只对对方 IP 放行 TCP 22000）。早期版本的脚本在 firewalld 运行时加的同样规则，也会一并删除。
+5. 清理同步目录里 Syncthing 自己的文件：`.stfolder`，以及传输中断时留下的 `.syncthing.*.tmp` 临时文件。
+6. 删除脚本的状态文件 `/etc/syncthing-vpc-sync.conf` 和 `/etc/sysctl.d/90-syncthing-inotify.conf`。
 
-同步目录里的文件不会被删除。如果不再需要，可以手动删掉其中的 `.stfolder` 和 `.stversions`。
+注意：
+
+- **`.stversions` 会单独询问**，默认保留。里面是被删除或覆盖前的旧版本，确认没有要找回的文件再删。
+- 冲突文件 `*.sync-conflict-*` 会保留，需要的话自己处理。
+- 同步还没完成时，脚本会在确认前提示，比如"本机还有 N 项没有从 A 同步过来"。**B 的首次同步没完成就卸载 B，B 上的数据是不完整的。**
+- 只卸载一台时，另一台会显示对方未连接，另一台上的文件不受影响。
+- 重复运行是安全的，已经删掉的部分会跳过。
+- 用之前任何一版脚本安装的，都可以用新脚本卸载：各版本安装的位置、服务名和状态文件格式都相同。
+- setup 中途失败、还没有生成状态文件时也可以运行：脚本会找到本机的 `syncthing@` 服务并卸载。但它不知道同步目录和对方 IP，所以同步目录里的 `.stfolder`、`.stversions` 和 ufw 规则要手动清理。
+- 以后想重新同步：两台都重新运行 setup。设备 ID 变了，要重新互相输入。
+
+脚本不会处理的：
+
+- 阿里云安全组里为 TCP 22000 单独加的规则，请到控制台删除。两台在同一个普通安全组、没加过规则的话，不用管。
+- `curl`、`jq`、`tar`：这些是通用工具，保留。
+- inotify 上限：删除设置文件后，服务器重启才会恢复原值。不重启也没有影响，它只是一个上限。
+- 脚本所在的目录：可以手动删除。
 
 ---
 
@@ -589,6 +603,7 @@ ufw delete allow from <对方私网 IP> to any port 22000 proto tcp
 
 - **这个脚本还没有在真实服务器上完整运行过。** 目前只在一台 Ubuntu 24.04 上用模拟环境测试过，包括以下几部分：
   - 用模拟的 Syncthing API，测试了完整的配置和切换流程、更改同步目录、各种出错提示，以及重复运行。
+  - 用模拟的 systemctl、dpkg、apt、ufw，在测试目录里测试了卸载：完整卸载、取消、服务停不下来、apt 安装的 Syncthing、没有状态文件、重复运行等情况。还用之前每一版脚本自己的代码写出状态文件、加上防火墙规则，再用当前脚本卸载，确认都能清理干净。
   - 用本地 HTTP 服务，测试了脚本调用 API 的方式。
   - 用真实的 v2.1.7 安装包，测试了安装包查找和 SHA256 校验。
 
